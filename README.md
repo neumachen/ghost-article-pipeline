@@ -1,7 +1,7 @@
 # GitHub to Ghost: Part 1 reference
 
-Companion source for [Publishing to Ghost from GitHub, Part 1](https://neumachen.dev/github-to-ghost-publishing-part-1/).
-The `part-1` tag preserves the implementation described in the article. Part
+Companion source for [Publishing to Ghost from GitHub, Part 1](https://neumachen.dev/articles/github-to-ghost-publishing-part-1/).
+The `part-1.0.1` tag preserves the implementation described in the article. Part
 1.5 will expand the follow-along guide; Part 2 will cover self-hosted runners.
 No prebuilt publisher image or reusable workflow is released with this edition.
 
@@ -20,7 +20,7 @@ you can administer. Hosted execution uses `ubuntu-24.04`. Local Docker Desktop
 integration tests require its host-networking option; ordinary checks and previews do not.
 
 ```sh
-git clone --branch part-1 --single-branch https://github.com/neumachen/ghost-article-pipeline.git ghost-publishing
+git clone --branch part-1.0.1 --single-branch https://github.com/neumachen/ghost-article-pipeline.git ghost-publishing
 cd ghost-publishing
 git switch -c main
 git remote rename origin reference
