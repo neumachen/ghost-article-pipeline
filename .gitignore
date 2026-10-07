@@ -1,0 +1,7 @@
+dist/
+.article-ghost/
+article/.local/
+article/node_modules/
+mise.local.toml
+.mise.local.toml
+.DS_Store

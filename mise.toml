@@ -1,0 +1,136 @@
+# Article tasks only; the application runs inside Docker.
+
+[tasks."article:image"]
+description = "Build the production article image (ARTICLE_TARGET selects another target)"
+# The launcher's --build-only mode: a dedicated docker build from article/,
+# with the image name and platform defaults held in one place. No container is
+# run, and the app's CLI is not involved, so nothing is assumed about it.
+run = "tools/article/run.sh --build-only"
+
+[tasks."article:image:test"]
+description = "Build the article test image on the shared production runtime"
+run = "env ARTICLE_TARGET=test tools/article/run.sh --build-only"
+
+[tasks."article:runtime-check"]
+description = "Verify the production container's user, mount and privilege contract"
+run = "env ARTICLE_TARGET=production ARTICLE_NETWORK=none tools/article/run.sh -- node /repo/article/test/runtime-evidence.mjs"
+
+[tasks."article:check"]
+description = "Validate the article registry and enrolled articles, in the container (no network)"
+# mise runs inline tasks with sh, which is dash on the Linux CI runners and
+# rejects set -o pipefail, so name the shell this script needs.
+shell = "bash -o errexit -c"
+run = '''
+set -euo pipefail
+exec env ARTICLE_NETWORK=none tools/article/run.sh -- node src/cli.mjs validate --repo /repo "$@"
+'''
+
+[tasks."article:test"]
+description = "Run the article pipeline unit tests in the container"
+# mise runs inline tasks with sh, which is dash on the Linux CI runners and
+# rejects set -o pipefail, so name the shell this script needs.
+shell = "bash -o errexit -c"
+run = '''
+set -euo pipefail
+exec env ARTICLE_TARGET=test ARTICLE_NETWORK=none tools/article/run.sh -- node --test 'test/*.test.mjs'
+'''
+
+[tasks."article:integration"]
+description = "Run the article pipeline integration tests against a disposable Ghost, then tear it down"
+# mise runs inline tasks with sh, which is dash on the Linux CI runners and
+# rejects set -o pipefail, so name the shell this script needs.
+shell = "bash -o errexit -c"
+# The compose stack is torn down on exit, whichever way the script leaves: the
+# EXIT trap fires on failure and on success alike. Never exec past the trap.
+run = '''
+set -euo pipefail
+cleanup() {
+  docker compose -f docker-compose.article.yml down -v
+}
+trap cleanup EXIT
+cleanup
+docker compose -f docker-compose.article.yml up -d --wait
+port=${ARTICLE_GHOST_PORT:-23680}
+# From the container, the disposable Ghost is the host's localhost, so the
+# article app runs with the host network. ARTICLE_INTEGRATION_URL points the
+# integration test at the disposable Ghost, and any production Admin API
+# credential in the environment is removed so none can reach this run: the
+# Ghost under test is the compose service, never production. The integration
+# test bootstraps its own throwaway integration key from the instance itself
+# and drives the CLI against temp repositories under the container's /tmp, so
+# the repository mount stays read-only, as for the other read-only tasks.
+env -u GHOST_ADMIN_API_KEY -u GHOST_ADMIN_API_URL \
+    ARTICLE_TARGET=production ARTICLE_TEST_MOUNT=1 \
+    ARTICLE_INTEGRATION_URL="http://localhost:$port" \
+    ARTICLE_NETWORK=host \
+    tools/article/run.sh -- node --test 'test/*.test.mjs'
+'''
+
+[tasks."article:evidence"]
+description = "Runner-contract evidence in the container: checkout ownership (C1) and committed history (C4)"
+# mise runs inline tasks with sh, which is dash on the Linux CI runners and
+# rejects set -o pipefail, so name the shell this script needs.
+shell = "bash -o errexit -c"
+# The evidence scripts build their fixtures in the container's own /tmp and
+# read git through the app's own module, so this needs no network, no Ghost and
+# no credentials. It is a LOCAL container run and is not a GitHub-hosted run.
+run = "bash article/test/history-evidence.sh"
+
+[tasks."article:prepare"]
+description = "Prepare an article candidate inside the repository (arguments pass through)"
+# mise appends the caller's arguments after `--` to the end of this script as
+# literal text, and "$@" expands empty there, so the appended options trail the
+# command: the pass-through is explicit, nothing is interpolated.
+# --repo /repo and --out /out are the container's defaults: the repository is
+# mounted at /repo and the output directory at /out (the launcher mounts host
+# <repo>/dist/article at /out). The CLI's parser stores flags in a Map keyed by
+# name, so a caller's later occurrence of the same flag wins over these
+# defaults.
+# Only the output mount is writable; committed source stays read-only.
+# mise runs inline tasks with sh, which is dash on the Linux CI runners and
+# rejects set -o pipefail, so name the shell this script needs.
+shell = "bash -o errexit -c"
+run = '''
+set -euo pipefail
+exec tools/article/run.sh -- node src/cli.mjs prepare --repo /repo --out /out "$@"
+'''
+
+[tasks."article:plan"]
+description = "Read-only plan of the article changes against Ghost. Needs Admin API credentials, sends nothing that mutates"
+# mise runs inline tasks with sh, which is dash on the Linux CI runners and
+# rejects set -o pipefail, so name the shell this script needs.
+shell = "bash -o errexit -c"
+run = '''
+set -euo pipefail
+exec tools/article/run.sh -- node src/cli.mjs plan --repo /repo "$@"
+'''
+
+[tasks."article:publish"]
+description = "AUTHORIZED ACTION: publish an article to Ghost. Needs Admin API credentials, changes the live site"
+# mise runs inline tasks with sh, which is dash on the Linux CI runners and
+# rejects set -o pipefail, so name the shell this script needs.
+shell = "bash -o errexit -c"
+run = '''
+set -euo pipefail
+exec tools/article/run.sh -- node src/cli.mjs publish --repo /repo "$@"
+'''
+
+[tasks."article:verify"]
+description = "Read back the published article and check its public page. Needs Admin API credentials"
+# mise runs inline tasks with sh, which is dash on the Linux CI runners and
+# rejects set -o pipefail, so name the shell this script needs.
+shell = "bash -o errexit -c"
+run = '''
+set -euo pipefail
+exec tools/article/run.sh -- node src/cli.mjs verify --repo /repo "$@"
+'''
+
+[tasks."article:preview"]
+description = "Render a local preview.html for an article, in the container (no network)"
+# mise runs inline tasks with sh, which is dash on the Linux CI runners and
+# rejects set -o pipefail, so name the shell this script needs.
+shell = "bash -o errexit -c"
+run = '''
+set -euo pipefail
+exec env ARTICLE_NETWORK=none tools/article/run.sh -- node src/cli.mjs preview --repo /repo --out /out/preview.html "$@"
+'''

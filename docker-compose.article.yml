@@ -1,0 +1,55 @@
+# Disposable, LOCAL-ONLY Ghost for the article pipeline's integration tests.
+#
+# NEVER production. This file is test infrastructure and nothing else:
+#
+# - It is started and torn down by `mise run article:integration`, which always
+#   runs `docker compose down -v` on exit, deleting the volume and its database.
+#   Nothing here is kept, backed up, or reused between runs.
+# - Everything in it is throwaway: the SQLite database, its content, and the
+#   account it creates are generated for one test run and then destroyed. Its
+#   credentials are generated throwaway values, not real credentials, and no
+#   real or realistic secret appears in this file or belongs in it.
+# - It binds to localhost only and nothing in this stack is reachable from, or
+#   allowed to talk to, the live publication.
+#
+# The containerized article app talks to it from inside the docker network
+# (`--network host` is used for `mise run article:integration`'s container run,
+# which reaches this port on localhost).
+#
+# Host port is configurable for machines where the default is taken:
+#   ARTICLE_GHOST_PORT=23681 docker compose -f docker-compose.article.yml up -d
+
+services:
+  ghost:
+    # Same Ghost application version as the local preview pin in mise.toml
+    # (GHOST_PREVIEW_VERSION) and the compatibility basis in mise.toml's header.
+    image: ghost:6.64.0-alpine
+    container_name: article-integration-ghost
+    ports:
+      # Loopback only: this stack is reachable from this machine and nothing
+      # else. The host port is configurable; the url below must match it, so
+      # it is parameterized the same way.
+      - "127.0.0.1:${ARTICLE_GHOST_PORT:-23680}:2368"
+    environment:
+      # The url must match the host port above, or Ghost serves wrong links.
+      url: http://localhost:${ARTICLE_GHOST_PORT:-23680}
+      # Development mode, as the local preview under .ghost-local/ also runs.
+      NODE_ENV: development
+      # Container login requires this to be off; the integration tests log in
+      # to create the throwaway Admin API integration.
+      security__staffDeviceVerification: "false"
+      # SQLite, as the local preview uses: no external database service.
+      database__client: sqlite3
+      database__connection__filename: /var/lib/ghost/content/data/ghost.db
+    volumes:
+      # A disposable volume avoids foreign-owned files in a Linux runner's checkout.
+      - article-ghost-content:/var/lib/ghost/content
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:2368/ >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+volumes:
+  article-ghost-content:

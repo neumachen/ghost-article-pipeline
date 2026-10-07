@@ -1,0 +1,96 @@
+# Article CI: validate the article pipeline and its enrolled articles, and
+# prepare the publication candidates for the GitHub → Ghost article pipeline,
+# on every branch push and pull request. See docs/TOOLING.md.
+#
+# The job `article-ci` is a report, not a required check like theme-ci. There
+# are no path filters, on purpose: a commit that does not touch article/ or
+# editorial/ runs this too, so the job always reports and a candidate artifact
+# exists for every commit pushed to main, which is what makes it publishable.
+#
+# No production credentials are used. Integration checks use disposable Ghost.
+
+name: Article CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  article-ci:
+    name: article-ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # mise will not read an untrusted mise.toml; trust this checkout, for this job.
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+      ARTICLE_TARGET: production
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the tools pinned in mise.toml
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.9.10
+
+      - name: Build the article pipeline image (mise run article:image)
+        run: mise run article:image
+
+      - name: Validate the registry and enrolled articles (mise run article:check)
+        run: mise run article:check
+
+      - name: Test the article pipeline (mise run article:test)
+        run: mise run article:test
+
+      - name: Verify the production runtime restrictions
+        run: mise run article:runtime-check
+
+      - name: Verify non-root checkout ownership and history
+        run: mise run article:evidence
+
+      - name: Exercise the production image against disposable Ghost
+        run: mise run article:integration
+
+      - name: Prepare the candidates for every enrolled article (mise run article:prepare)
+        # The repository is mounted read-only for the prepare; the task itself
+        # passes the container defaults --repo /repo --out /out, so the
+        # candidates are written to the /out mount, which the launcher mounts
+        # from dist/article — where the artifact upload below finds them on the
+        # host. No host-relative --out is passed: inside the container it would
+        # resolve under /app, not the mounted repository.
+        # The prepare emits candidate_count (the number of candidates written)
+        # to GITHUB_OUTPUT; the upload below gates on it, so a repository with
+        # an empty registry (nothing enrolled, by design) skips the upload
+        # deliberately instead of failing it — while a populated registry keeps
+        # if-no-files-found: error, so a genuinely missing artifact is still an
+        # error, never a silent warn.
+        run: mise run article:prepare -- --all --revision "$GITHUB_SHA"
+        # The id the upload step's `if` gates on; candidate_count is emitted
+        # inside the container through the launcher's GITHUB_OUTPUT passthrough.
+        id: prepare
+
+      - name: Retain the prepared candidates
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        # An empty registry prepares zero candidates by design; gating on
+        # candidate_count keeps "no candidates because none were enrolled"
+        # distinct from "candidates expected but missing" — the populated case
+        # still uploads with if-no-files-found: error, so a genuine upload
+        # failure is still caught instead of hidden.
+        if: steps.prepare.outputs.candidate_count != '0'
+        with:
+          name: article-candidates-${{ github.sha }}
+          path: dist/article
+          if-no-files-found: error
+          # Candidates from pushes to main are the publish candidates: keep them
+          # for the repository's retention limit, currently 90 days. Others are
+          # only for review.
+          retention-days: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 90 || 7 }}
+          # A re-run replaces the candidates with a fresh, validated build of
+          # the same commit instead of failing on the existing name.
+          overwrite: true

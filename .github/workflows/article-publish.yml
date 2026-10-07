@@ -1,0 +1,323 @@
+# Article publish: put an article candidate that Article CI prepared on main
+# live on Ghost. Started by hand only; nothing triggers it automatically. Read
+# docs/TOOLING.md before running it.
+#
+#   select  Holds no Ghost credentials. Checks the typed article id against a
+#           fixed pattern and its enrollment in editorial/articles/registry.json
+#           (the container's validate), resolves the revision to a full commit
+#           on main, then selects and verifies the candidate artifact by
+#           provenance (the container's select-artifact: Article CI workflow,
+#           push, main, this repository, exactly one run, succeeded, head SHA
+#           match, unexpired, digest match) and inspects the candidate itself.
+#   publish Runs in the ghost-production environment, whose secret only main can
+#           use. Fetches the verified candidate artifact again by its id and
+#           re-checks its digest (the container's fetch-artifact), then either
+#           plans (reads Ghost, changes nothing) or publishes (mutates, then
+#           verifies) — the article app's publish command with --mode plan|publish.
+#
+# Article and theme work do not block each other: this workflow's concurrency
+# group is separate from the theme pipeline's ghost-production-theme.
+#
+# The workflow inputs are treated as data, never as code: they reach the shell
+# only through environment variables, and the article id is checked against a
+# fixed pattern before any use. The candidate is verified before use, twice
+# over: select establishes its provenance (only Article CI, for a push to
+# main, in this repository, one successful run, this exact commit, unexpired,
+# digest-matched, can have produced it) and inspects the candidate itself;
+# publish re-fetches the same artifact by the id select verified and re-checks
+# the same digest, never re-resolving by name. Validation — Article CI, and
+# this workflow's select job — never sees Ghost credentials; only the publish
+# job's Ghost step, in the ghost-production environment, does. The container
+# image is built in the run from the pinned base in article/, so nothing
+# depends on an unpublished registry image.
+
+name: Article publish
+run-name: "Article ${{ inputs.operation }} ${{ inputs.article }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      article:
+        description: "Registry id of the article to publish, as enrolled in editorial/articles/registry.json."
+        required: true
+        type: string
+      revision:
+        description: "Full 40-character commit on main the candidate was prepared from. Leave empty for the current head of main."
+        required: false
+        type: string
+        default: ""
+      operation:
+        description: "plan reads Ghost and changes nothing. publish mutates it, then verifies."
+        required: true
+        type: choice
+        options:
+          - plan
+          - publish
+        default: plan
+      repair_state:
+        description: "Reconcile state only when the committed candidate already matches Ghost. Never rewrites the post or uploads images."
+        required: false
+        type: boolean
+        default: false
+      confirm:
+        description: "publish refuses unless this is yes. It changes the live publication."
+        required: true
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
+
+permissions: {}
+
+concurrency:
+  group: ghost-production-article
+  cancel-in-progress: false
+
+jobs:
+  select:
+    name: Select and verify the candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    env:
+      # mise will not read an untrusted mise.toml; trust this checkout, for
+      # this job and every step of it that runs mise.
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+      ARTICLE_TARGET: production
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+      ci_run_id: ${{ steps.candidate.outputs.ci_run_id }}
+      candidate_artifact_id: ${{ steps.candidate.outputs.artifact_id }}
+      candidate_artifact_digest: ${{ steps.candidate.outputs.artifact_digest }}
+    steps:
+      - name: Refuse anything but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Article publishing runs only from main; this run is on $GITHUB_REF."
+          exit 1
+
+      - name: Check out main with its history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the tools pinned in mise.toml
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.9.10
+
+      - name: Verify the typed article id and its enrollment
+        id: article
+        # No credentials: this step only pattern-checks the id and runs the
+        # container's validate against the repository, with no network use by
+        # the app itself.
+        run: |
+          set -euo pipefail
+          # The article id is data: it must match this fixed, strict pattern
+          # before it is used anywhere, and it is only ever used quoted.
+          if ! printf '%s' "$ARTICLE_ID" | grep -Eq '^[a-z0-9][a-z0-9-]{0,63}$'; then
+            echo "::error::Article id '$ARTICLE_ID' is not a safe registry id (expected ^[a-z0-9][a-z0-9-]{0,63}$)."
+            exit 1
+          fi
+          # Enrollment is the container's own check, against the checked-out
+          # registry at editorial/articles/registry.json.
+          mise run article:image
+          mise run article:check -- --article "$ARTICLE_ID"
+          echo "article=$ARTICLE_ID" >> "$GITHUB_OUTPUT"
+          echo "Article '$ARTICLE_ID' is enrolled."
+        env:
+          ARTICLE_ID: ${{ inputs.article }}
+
+      - name: Resolve the revision to a full commit on main
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ -z "$REVISION" ]; then
+            # An empty revision means the current head of main.
+            commit="$GITHUB_SHA"
+          elif printf '%s' "$REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+            commit="$REVISION"
+          else
+            echo "::error::Revision '$REVISION' is not a full 40-character commit id."
+            exit 1
+          fi
+          # The candidate must be built from a commit that is on main.
+          if ! git merge-base --is-ancestor "$commit" "$GITHUB_SHA"; then
+            echo "::error::Commit $commit is not on main (not an ancestor of $GITHUB_SHA)."
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Resolved revision to $commit, which is on main."
+        env:
+          REVISION: ${{ inputs.revision }}
+
+      - name: Select and verify the candidate artifact, by provenance
+        id: candidate
+        # No Ghost credentials: this step talks only to the GitHub REST API,
+        # with the workflow's own token, through the app's select-artifact
+        # command — the mirror of the theme pipeline's reviewed
+        # tools/release-artifact.mjs select. A matching artifact name alone
+        # establishes nothing; only a candidate demonstrably produced by
+        # Article CI, for a push to main, for exactly this commit, in this
+        # repository, by one successful run, unexpired, whose download matches
+        # the digest GitHub recorded, can be selected. Every failure is a
+        # refusal (exit 2): nothing mutating happens in this job at all.
+        run: |
+          set -euo pipefail
+          mise run article:image
+          tools/article/run.sh -- node src/cli.mjs select-artifact \
+            --repo /repo \
+            --revision "$COMMIT" \
+            --out "$RUNNER_TEMP/candidates"
+        env:
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+
+      - name: Verify the candidate itself, in the container
+        # The candidate's own self-consistency: the app's inspect command
+        # verifies integrity (hashes recomputed from the files), the publish
+        # gates, and the id/revision match, on the directory select-artifact
+        # extracted. No Ghost credentials reach this: inspect reads the
+        # candidate and the repository only.
+        run: |
+          set -euo pipefail
+          tools/article/run.sh -- node src/cli.mjs inspect \
+            --candidate "$RUNNER_TEMP/candidates/$ARTICLE" \
+            --article "$ARTICLE" \
+            --revision "$COMMIT" \
+            --repo /repo
+        env:
+          ARTICLE: ${{ steps.article.outputs.article }}
+          COMMIT: ${{ steps.resolve.outputs.commit }}
+
+  publish:
+    name: ${{ inputs.operation == 'publish' && 'Publish and verify' || 'Plan (read-only)' }}
+    needs: select
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      # mise will not read an untrusted mise.toml; trust this checkout, for
+      # this job and every step of it that runs mise.
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+      ARTICLE_TARGET: production
+    environment:
+      name: ghost-production
+      # Only a publish changes production, so only a publish records a deployment.
+      deployment: ${{ inputs.operation == 'publish' }}
+    steps:
+      # Full history: the publish gates check revisions against the repository
+      # (verifyCandidateForPublish's commitExists, decide's isAncestor against
+      # the previously published revision), so an eligible non-HEAD revision or
+      # the prior publication's revision must be present in this checkout. A
+      # shallow clone would make a legitimate publication fail, or decide an
+      # ancestry check on absent history.
+      - name: Check out main with its history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install the tools pinned in mise.toml
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.9.10
+
+      - name: Refuse an unconfirmed publish
+        # Before anything mutating runs: a publish refuses unless confirm is yes,
+        # and the run logs which article and commit are about to be published.
+        run: |
+          set -euo pipefail
+          if [ "$OPERATION" = "publish" ]; then
+            if [ "$CONFIRM" != "yes" ]; then
+              echo "::error::operation is publish but confirm is '$CONFIRM'. Run the workflow again with confirm: yes."
+              exit 1
+            fi
+            echo "Authorized: publishing article '$ARTICLE' from commit $COMMIT to the live publication."
+          else
+            echo "Plan only: reading Ghost for article '$ARTICLE' from commit $COMMIT. Nothing is sent that changes Ghost."
+          fi
+        env:
+          OPERATION: ${{ inputs.operation }}
+          CONFIRM: ${{ inputs.confirm }}
+          ARTICLE: ${{ inputs.article }}
+          COMMIT: ${{ needs.select.outputs.commit }}
+
+      - name: Fetch the verified candidate artifact again, by its id
+        # The same artifact select verified, fetched by the id it verified (never
+        # re-resolved by name), re-checked against the same digest, and its
+        # producing run re-read and re-qualified: the candidate used is the
+        # candidate that was checked, whatever replaced same-named artifacts in
+        # between. Like select, this step holds no Ghost credentials.
+        run: |
+          set -euo pipefail
+          mise run article:image
+          tools/article/run.sh -- node src/cli.mjs fetch-artifact \
+            --revision "$COMMIT" \
+            --artifact-id "$ARTIFACT_ID" \
+            --artifact-digest "$ARTIFACT_DIGEST" \
+            --out "$RUNNER_TEMP/candidate"
+        env:
+          COMMIT: ${{ needs.select.outputs.commit }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          ARTIFACT_ID: ${{ needs.select.outputs.candidate_artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.select.outputs.candidate_artifact_digest }}
+
+      - name: Re-verify the candidate in the container before publishing
+        # The same inspect select ran, on the candidate fetch-artifact
+        # re-extracted and re-verified: the app verifies what it is about to
+        # publish, so no layout assumption made by the workflow goes unchecked.
+        run: |
+          set -euo pipefail
+          tools/article/run.sh -- node src/cli.mjs inspect \
+            --candidate "$RUNNER_TEMP/candidate/$ARTICLE" \
+            --article "$ARTICLE" \
+            --revision "$COMMIT" \
+            --repo /repo
+        env:
+          ARTICLE: ${{ inputs.article }}
+          COMMIT: ${{ needs.select.outputs.commit }}
+
+      - name: ${{ inputs.operation == 'publish' && 'Publish to Ghost' || 'Plan against Ghost (read-only)' }}
+        run: |
+          set -euo pipefail
+          repair_args=()
+          if [ "$REPAIR_STATE" = "true" ]; then repair_args+=(--repair-state); fi
+          mise run article:publish -- \
+            --candidate "$RUNNER_TEMP/candidate/$ARTICLE" \
+            --article "$ARTICLE" \
+            --revision "$COMMIT" \
+            --mode "$OPERATION" \
+            --record "$RUNNER_TEMP/article-record.json" "${repair_args[@]}"
+        env:
+          REPAIR_STATE: ${{ inputs.repair_state }}
+          OPERATION: ${{ inputs.operation }}
+          ARTICLE: ${{ inputs.article }}
+          COMMIT: ${{ needs.select.outputs.commit }}
+          GHOST_ADMIN_API_URL: ${{ vars.GHOST_ADMIN_API_URL }}
+          GHOST_ADMIN_API_KEY: ${{ secrets.GHOST_ADMIN_API_KEY }}
+
+      - name: Summarize
+        if: always()
+        # The app's summary command writes the job summary itself, through the
+        # GITHUB_STEP_SUMMARY path the launcher passes into the container.
+        run: tools/article/run.sh -- node src/cli.mjs summary --record "$RUNNER_TEMP/article-record.json"
+
+      - name: Keep the publish record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: article-publish-record
+          path: ${{ runner.temp }}/article-record.json
+          if-no-files-found: ignore
+          retention-days: 90

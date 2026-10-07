@@ -1,0 +1,12 @@
+# node_modules is installed inside the image by npm ci; it must never shadow
+# the copy that runs the tests from a bind mount.
+node_modules
+npm-debug.log
+.local
+probe*.mjs
+.*probe*.mjs
+# git and Docker plumbing that must not enter the build context
+.git
+.gitignore
+Dockerfile
+.dockerignore
